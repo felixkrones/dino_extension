@@ -34,6 +34,9 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
+from MIMIC import MIMIC_Dataset
+
+
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
@@ -42,6 +45,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
 
     # Model parameters
+    parser.add_argument('--input_channels', default=3, type=int, help='input channel size for medical images. If True, then 2D image is repeated thrice.')
     parser.add_argument('--arch', default='vit_small', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
@@ -116,16 +120,19 @@ def get_args_parser():
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
 
-    # Misc
+    # Misc   
+    parser.add_argument('--dataset_name', default=None, type=str, help='dset name')
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--n_samples', default=None, type=int, help='Pre-training dataset size')   
+    parser.add_argument('--large_img', default=False, type=bool, help="If original images are there.")    
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
-    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    parser.add_argument("--local-rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
 
@@ -134,6 +141,7 @@ def train_dino(args):
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    print("-------------------------------------------------------------------")
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
@@ -141,8 +149,15 @@ def train_dino(args):
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
+        args
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    if args.dataset_name != "MIMIC":
+        print(f"Loading data from {args.data}")
+        dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    else:
+        print("Loading MIMIC data")
+        dataset = MIMIC_Dataset(datapath=args.data_path, transform=transform, split="train", input_channels=args.input_channels, n_samples = args.n_samples, large_img=args.large_img)
+
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -162,8 +177,9 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
+            in_chans=args.input_channels
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, in_chans=args.input_channels)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -265,8 +281,10 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
+    print("-------------------------------------------------------------------")
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
+        start_time = time.time()
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
@@ -293,6 +311,7 @@ def train_dino(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        print(f"Finished epoch {epoch} after {round((time.time()-start_time)/60,4)} min.")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -417,7 +436,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, args):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -426,10 +445,32 @@ class DataAugmentationDINO(object):
             ),
             transforms.RandomGrayscale(p=0.2),
         ])
-        normalize = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
+
+
+        if args.dataset_name in ['MIMIC']:
+            print("Using MIMIC mean and sd")
+            mean_value_1D = (0.5292)
+            std_value_1D = (0.2507)
+            mean_value_3D = (0.5292,0.5292,0.5292)
+            std_value_3D = (0.2507,0.2507,0.2507)
+        else:
+            print("Using general mean and sd")
+            mean_value_1D = (0.485)
+            std_value_1D = (0.229)
+            mean_value_3D = (0.485, 0.456, 0.406)
+            std_value_3D = (0.229, 0.224, 0.225)
+        if (args.input_channels == 1) or (str(args.input_channels) == "1"):
+            normalize = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean_value_1D, std_value_1D),  
+            ])
+        elif (args.input_channels == 3) or (str(args.input_channels) == "3"):
+            normalize = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean_value_3D, std_value_3D),
+            ])
+        else:
+            raise ValueError(f"input_channels must be 1 or 3, not {args.input_channels}")
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
